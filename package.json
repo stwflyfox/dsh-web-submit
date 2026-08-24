@@ -1,0 +1,25 @@
+{
+  "name": "dsh-web-submit",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness plugin: run headless-style tasks through the running dsh web process via one HTTP endpoint (POST /x/headless) with status and SSE live-event endpoints — CLI-invoked runs are visible in the Web UI in real time.",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "plugin",
+    "headless",
+    "web",
+    "bridge",
+    "cordis"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}
