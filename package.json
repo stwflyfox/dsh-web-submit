@@ -4,8 +4,14 @@
   "description": "DeepSeek Harness plugin: run headless-style tasks through the running dsh web process via one HTTP endpoint (POST /x/headless) with status and SSE live-event endpoints — CLI-invoked runs are visible in the Web UI in real time.",
   "type": "module",
   "main": "index.js",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "files": [
     "index.js",
+    "cordis.patch.yml",
     "README.md",
     "LICENSE"
   ],
