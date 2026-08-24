@@ -79,6 +79,30 @@ export async function apply(ctx, config) {
   const STATUS = `${prefix}/headless/status`;
   const EVENTS = `${prefix}/headless/events`;
 
+  /** In-process RPC against the harness's own /api surface. */
+  async function rpc(method, payload) {
+    const base = `http://127.0.0.1:${ctx.webServer.port}`;
+    const res = await fetch(`${base}/api/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        type: "client-request",
+        rpcId: randomUUID(),
+        method,
+        payload,
+      }),
+    });
+    const resp = await res.json();
+    const result = resp && resp.result;
+    if (!result || !result.ok) {
+      const err = result && result.error;
+      throw new Error(
+        err && err.message ? err.message : JSON.stringify(err || resp || "rpc failed"),
+      );
+    }
+    return result.value;
+  }
+
   ctx.effect(() =>
     ctx.webServer.register({
       kind: "prefix",
@@ -90,6 +114,34 @@ export async function apply(ctx, config) {
         }
         const url = new URL(req.url, "http://localhost");
         const path = url.pathname;
+
+        // POST /x/headless : create a session in the web process and prompt it.
+        if (req.method === "POST" && path === HEADLESS) {
+          try {
+            const body = await readBody(req, config.maxBodyBytes);
+            const task = typeof body.task === "string" ? body.task.trim() : "";
+            if (!task) {
+              sendJson(res, 400, { ok: false, error: "missing 'task'" });
+              return;
+            }
+            const createReq = { cwd: body.cwd || process.cwd() };
+            if (body.preset) createReq.agentPreset = body.preset;
+            const created = await rpc("session.create", createReq);
+            await rpc("session.prompt", {
+              sessionId: created.sessionId,
+              mode: body.mode === "steer" ? "steer" : "queue",
+              content: [{ type: "text", text: task }],
+            });
+            sendJson(res, 200, {
+              ok: true,
+              sessionId: created.sessionId,
+              agentPreset: created.agentPreset || null,
+            });
+          } catch (err) {
+            sendJson(res, 500, { ok: false, error: String((err && err.message) || err) });
+          }
+          return;
+        }
 
         sendJson(res, 404, { ok: false, error: "not found" });
       },
