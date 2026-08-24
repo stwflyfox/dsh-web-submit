@@ -143,6 +143,34 @@ export async function apply(ctx, config) {
           return;
         }
 
+        // GET /x/headless/status?sessionId=...
+        if (req.method === "GET" && path === STATUS) {
+          const sid = url.searchParams.get("sessionId");
+          if (!sid) {
+            sendJson(res, 400, { ok: false, error: "missing sessionId" });
+            return;
+          }
+          try {
+            const history = await rpc("session.history", {
+              sessionId: sid,
+              maxMessages: 60,
+            });
+            const events = (history.events || []).map((e) => {
+              const ev = e.event || e;
+              return { type: ev.type, seq: ev.seq, time: ev.time, data: ev.data };
+            });
+            sendJson(res, 200, {
+              ok: true,
+              sessionId: sid,
+              events,
+              hasMore: !!history.hasMore,
+            });
+          } catch (err) {
+            sendJson(res, 500, { ok: false, error: String((err && err.message) || err) });
+          }
+          return;
+        }
+
         sendJson(res, 404, { ok: false, error: "not found" });
       },
     }),
