@@ -171,6 +171,56 @@ export async function apply(ctx, config) {
           return;
         }
 
+        // GET /x/headless/events?sessionId=...  (SSE live stream, poll-based)
+        if (req.method === "GET" && path === EVENTS) {
+          const sid = url.searchParams.get("sessionId");
+          if (!sid) {
+            sendJson(res, 400, { ok: false, error: "missing sessionId" });
+            return;
+          }
+          res.writeHead(200, {
+            "content-type": "text/event-stream",
+            "cache-control": "no-cache",
+            connection: "keep-alive",
+          });
+          res.write("retry: 2000\n\n");
+          const seen = new Set();
+          let sawEnd = false;
+          let drain = 0;
+          try {
+            while (!res.writableEnded) {
+              const history = await rpc("session.history", {
+                sessionId: sid,
+                maxMessages: 40,
+              });
+              for (const e of history.events || []) {
+                const ev = e.event || e;
+                if (seen.has(ev.seq)) continue;
+                seen.add(ev.seq);
+                const frame = { type: ev.type, seq: ev.seq, time: ev.time, data: ev.data };
+                res.write(`data: ${JSON.stringify(frame)}\n\n`);
+                if (ev.type === "turn/end") {
+                  sawEnd = true;
+                  drain = 0;
+                }
+              }
+              if (sawEnd) {
+                drain += 1;
+                if (drain >= 3) {
+                  res.write(`data: ${JSON.stringify({ type: "stream/end", sessionId: sid })}\n\n`);
+                  break;
+                }
+              }
+              await new Promise((r) => setTimeout(r, config.pollIntervalMs));
+            }
+          } catch {
+            // stream ends on error; client can fall back to /status
+          } finally {
+            res.end();
+          }
+          return;
+        }
+
         sendJson(res, 404, { ok: false, error: "not found" });
       },
     }),
