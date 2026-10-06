@@ -12,13 +12,22 @@
  * shows it in real time (same live_sessions store, same event broadcast), and
  * permission / approval questions appear in the Web UI for the user.
  *
- * The plugin drives the process's own built-in /api RPC surface over a
- * loopback HTTP request (same paths dsh-x / the web UI client use), which
- * keeps it in exact sync with the UI and needs no private service wiring.
+ * The plugin drives the process's own built-in session Remote through the DSH
+ * host's in-process Typert Gateway (`ctx.typertGateway.invoke`) — the same
+ * dispatch the Web UI client itself uses — so no loopback HTTP round-trip and
+ * no re-entry into the browser-guarded HTTP transport is needed.
+ *
+ * `POST /x/headless` resolves `body.cwd` against the installed DSH workspace
+ * registry and creates the session with `workspaceId` — never with `cwd`, and
+ * never with both — so DSH itself attaches the new session to that Workspace
+ * and the conversation is grouped in the Web UI instead of 未分组. A cwd that
+ * matches no registered Workspace, or more than one, fails closed.
+ *
  * Loopback requests only.
  */
 import z from "@deepseek-ai/schemastery";
 import { randomUUID } from "node:crypto";
+import { resolve as resolvePath } from "node:path";
 
 export const name = "dsh-web-submit";
 
@@ -79,28 +88,57 @@ export async function apply(ctx, config) {
   const STATUS = `${prefix}/headless/status`;
   const EVENTS = `${prefix}/headless/events`;
 
-  /** In-process RPC against the harness's own /api surface. */
-  async function rpc(method, payload) {
-    const base = `http://127.0.0.1:${ctx.webServer.port}`;
-    const res = await fetch(`${base}/api/${method}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        type: "client-request",
-        rpcId: randomUUID(),
-        method,
-        payload,
-      }),
+  /**
+   * In-process Remote dispatch through the harness's own Typert Gateway.
+   *
+   * `typertGateway` is resolved lazily instead of being declared in `inject`,
+   * so an unavailable Gateway can never prevent this plugin from loading and
+   * registering its routes; a missing service fails the single request instead.
+   */
+  async function remote(namespace, method, request) {
+    const gateway = ctx.get("typertGateway");
+    if (!gateway || typeof gateway.invoke !== "function") {
+      throw new Error("typertGateway service is unavailable in this process");
+    }
+    return gateway.invoke({ namespace, method, args: { request } });
+  }
+
+  /**
+   * Resolve the DSH Workspace that owns one directory.
+   *
+   * `session.create` accepts `workspaceId` or `cwd`, never both, and only
+   * `workspaceId` makes DSH attach the created session to a Workspace (which
+   * is what groups the conversation in the Web UI). The id is therefore
+   * resolved dynamically from the live workspace registry — never hard-coded —
+   * by exact normalized-absolute-path comparison against each Workspace's own
+   * `path`, never against its display title.
+   *
+   * Resolution fails closed: an unmatched or ambiguous directory throws, and
+   * the caller never falls back to a cwd-only, ungrouped session.
+   */
+  function resolveWorkspaceForCwd(requestedCwd) {
+    const registry = ctx.get("workspaceRegistry");
+    if (!registry || typeof registry.list !== "function") {
+      throw new Error("workspaceRegistry service is unavailable in this process");
+    }
+    const target = resolvePath(requestedCwd);
+    const matches = registry.list().filter((workspace) => {
+      if (!workspace || typeof workspace.path !== "string") return false;
+      return resolvePath(workspace.path) === target;
     });
-    const resp = await res.json();
-    const result = resp && resp.result;
-    if (!result || !result.ok) {
-      const err = result && result.error;
+    if (matches.length === 0) {
+      throw new Error(`No DSH workspace registered for cwd "${target}"`);
+    }
+    if (matches.length > 1) {
       throw new Error(
-        err && err.message ? err.message : JSON.stringify(err || resp || "rpc failed"),
+        `Ambiguous DSH workspace for cwd "${target}": ${matches.length} registered workspaces share that path`,
       );
     }
-    return result.value;
+    const workspace = matches[0];
+    if (typeof workspace.id !== "string" || !workspace.id) {
+      throw new Error(`DSH workspace registered for cwd "${target}" has no id`);
+    }
+    return workspace;
   }
 
   ctx.effect(() =>
@@ -124,10 +162,15 @@ export async function apply(ctx, config) {
               sendJson(res, 400, { ok: false, error: "missing 'task'" });
               return;
             }
-            const createReq = { cwd: body.cwd || process.cwd() };
+            // cwd -> registered Workspace; the create request carries the
+            // resolved `workspaceId` only (DSH then uses `workspace.path` as
+            // the session cwd and attaches the session to that Workspace).
+            const workspace = resolveWorkspaceForCwd(body.cwd || process.cwd());
+            const createReq = { workspaceId: workspace.id };
             if (body.preset) createReq.agentPreset = body.preset;
-            const created = await rpc("session.create", createReq);
-            await rpc("session.prompt", {
+            const created = await remote("session", "create", createReq);
+            await remote("session", "prompt", {
+              requestId: randomUUID(),
               sessionId: created.sessionId,
               mode: body.mode === "steer" ? "steer" : "queue",
               content: [{ type: "text", text: task }],
@@ -151,11 +194,12 @@ export async function apply(ctx, config) {
             return;
           }
           try {
-            const history = await rpc("session.history", {
-              sessionId: sid,
+            const page = await remote("session", "page", {
+              address: { kind: "session", sessionId: sid },
+              throughSeq: -1,
               maxMessages: 60,
             });
-            const events = (history.events || []).map((e) => {
+            const events = (page.records || []).map((e) => {
               const ev = e.event || e;
               return { type: ev.type, seq: ev.seq, time: ev.time, data: ev.data };
             });
@@ -163,7 +207,7 @@ export async function apply(ctx, config) {
               ok: true,
               sessionId: sid,
               events,
-              hasMore: !!history.hasMore,
+              hasMore: !!page.hasMore,
             });
           } catch (err) {
             sendJson(res, 500, { ok: false, error: String((err && err.message) || err) });
@@ -189,11 +233,12 @@ export async function apply(ctx, config) {
           let drain = 0;
           try {
             while (!res.writableEnded) {
-              const history = await rpc("session.history", {
-                sessionId: sid,
+              const page = await remote("session", "page", {
+                address: { kind: "session", sessionId: sid },
+                throughSeq: -1,
                 maxMessages: 40,
               });
-              for (const e of history.events || []) {
+              for (const e of page.records || []) {
                 const ev = e.event || e;
                 if (seen.has(ev.seq)) continue;
                 seen.add(ev.seq);
