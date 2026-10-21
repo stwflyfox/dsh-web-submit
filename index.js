@@ -100,7 +100,39 @@ export async function apply(ctx, config) {
     if (!gateway || typeof gateway.invoke !== "function") {
       throw new Error("typertGateway service is unavailable in this process");
     }
-    return gateway.invoke({ namespace, method, args: { request } });
+    // dsh >= 0.2.1-rc.2 requires the calling Peer: invoke() asserts
+    // request.peer.signal and reads request.peer.principal. The Host's
+    // connection service owns the owner Peer for this process.
+    const peer = ctx.get("connection")?.browserPeer;
+    if (!peer) throw new Error("connection service (owner peer) is unavailable in this process");
+    return gateway.invoke({ peer, namespace, method, args: { request } });
+  }
+
+  /**
+   * Read one session event page. `throughSeq` must not sit past the live log
+   * cursor; the Host rejects it with "past cursor <n>" and the cursor is the
+   * only valid cut, so retry once with it.
+   */
+  async function readPage(sessionId, maxMessages) {
+    const request = {
+      address: { kind: "session", sessionId },
+      throughSeq: Number.MAX_SAFE_INTEGER,
+      maxMessages,
+    };
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        return await remote("session", "page", request);
+      } catch (error) {
+        const message = String((error && error.message) || error);
+        const marker = "past cursor ";
+        const at = message.indexOf(marker);
+        if (at === -1) throw error;
+        const digits = message.slice(at + marker.length).match(/[0-9]+/);
+        if (digits === null) throw error;
+        request.throughSeq = Number(digits[0]);
+      }
+    }
+    throw new Error("session.page rejected every log cut");
   }
 
   /**
@@ -194,11 +226,7 @@ export async function apply(ctx, config) {
             return;
           }
           try {
-            const page = await remote("session", "page", {
-              address: { kind: "session", sessionId: sid },
-              throughSeq: -1,
-              maxMessages: 60,
-            });
+            const page = await readPage(sid, 60);
             const events = (page.records || []).map((e) => {
               const ev = e.event || e;
               return { type: ev.type, seq: ev.seq, time: ev.time, data: ev.data };
@@ -233,11 +261,7 @@ export async function apply(ctx, config) {
           let drain = 0;
           try {
             while (!res.writableEnded) {
-              const page = await remote("session", "page", {
-                address: { kind: "session", sessionId: sid },
-                throughSeq: -1,
-                maxMessages: 40,
-              });
+              const page = await readPage(sid, 40);
               for (const e of page.records || []) {
                 const ev = e.event || e;
                 if (seen.has(ev.seq)) continue;
