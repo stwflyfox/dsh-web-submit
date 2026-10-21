@@ -51,6 +51,39 @@ as if you had typed the task there.
 | `routePrefix` | `/x` | Route prefix for all endpoints |
 | `maxBodyBytes` | `1048576` | Max request body size |
 
+## Optional: shell wrapper for `dsh headless` (POSIX)
+
+`examples/headless-shim.sh` makes `dsh headless "task"` submit through this plugin instead of
+starting a separate process. The session then appears in the Web UI, while the command still waits
+for `turn/end`, so it can be used synchronously from scripts.
+
+It is purely client-side: the plugin cannot register a `dsh` subcommand itself, because dsh's CLI
+resolves `headless` before any plugin is loaded. That is why the wrapper has to sit on `PATH`.
+
+```bash
+install -m 0755 examples/headless-shim.sh ~/.local/bin/dsh
+type -a dsh     # ~/.local/bin/dsh must come first, before the real CLI
+```
+
+| Input | Result |
+|---|---|
+| `dsh headless "task"` / `dsh --profile headless "task"` | `POST /x/headless`, wait for `turn/end` |
+| task on stdin (`… \| dsh headless -`, or no arguments plus a pipe) | same |
+| `--json` / `--session-id` / `-h` / `--help`, unknown options, non-headless subcommands | passed through to the real CLI |
+| plugin unreachable, or the submission is rejected | warns on stderr, falls back to the real CLI |
+
+Task-level options the wrapper consumes (never forwarded): `-C/--cwd`, `--preset`, `--permission`,
+`--provider`/`--model`, `--effort`, `--timeout`. Environment: `DSH_WEB_SUBMIT_URL`
+(default `http://127.0.0.1:3080`), `DSH_HEADLESS_CWD`, `DSH_HEADLESS_TIMEOUT`, `DSH_HEADLESS_CLI`.
+
+Notes:
+
+- POSIX shells only (Linux, macOS, WSL). Windows callers keep using `curl` or their own script.
+- systemd/launcher units that start `dsh` by absolute path bypass the wrapper — deliberately.
+- Uninstall with `rm ~/.local/bin/dsh`.
+- `--permission` (and the other task options) only matter for plugin versions that support them;
+  older versions simply ignore unknown body fields, so the submission still succeeds.
+
 ## License
 
 MIT
